@@ -1,0 +1,6 @@
+langgraph>=1.0
+langgraph-checkpoint-sqlite>=3.0
+langchain-core>=1.0
+langchain-deepseek>=1.0
+pandas>=2.2
+huggingface_hub>=0.30
