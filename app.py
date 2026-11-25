@@ -51,8 +51,8 @@ if not key:
         key = userdata.get("DEEPSEEK_API_KEY")
     except Exception:
         key = None
-if not key and os.environ.get("SPACE_ID"):
-    raise RuntimeError("Add DEEPSEEK_API_KEY as a secret in the Space settings (Settings > Variables and secrets).")
+if not key and (os.environ.get("SPACE_ID") or os.environ.get("RENDER")):
+    raise RuntimeError("Add DEEPSEEK_API_KEY in the hosting settings (Space secrets or Render environment variables).")
 if not key:
     from getpass import getpass
     key = getpass("Paste a DeepSeek API key (input is hidden, not saved): ")
@@ -89,6 +89,8 @@ except Exception as e:
 # > There are NO demo accounts. The tests (Cells 18-21) create two temporary TEST members
 # > with invented training data and remove them again in Cell 22.
 ON_SPACE = bool(os.environ.get("SPACE_ID"))        # Hugging Face sets SPACE_ID inside a Space
+ON_RENDER = bool(os.environ.get("RENDER"))          # Render sets RENDER=true on its servers
+ON_HOSTED = ON_SPACE or ON_RENDER                   # a web host: listen on 0.0.0.0 and the PORT it gives
 
 
 def pick_data_dir():
@@ -209,7 +211,7 @@ if BACKUP_ON:
         print(f"Backup restore failed ({type(e).__name__}: {str(e)[:150]}). Check HF_TOKEN and FITPLAN_BACKUP_REPO.")
     threading.Thread(target=_backup_loop, daemon=True).start()
     atexit.register(lambda: backup_now("app closing"))
-    if ON_SPACE:                     # a Space is stopped with SIGTERM: save once more before closing
+    if ON_HOSTED:                    # a web host stops the app with SIGTERM: save once more before closing
         import signal
 
         def _save_and_exit(*_):
@@ -246,19 +248,44 @@ PROGRAM_B = {
 }
 TEST_IDS = ["test-member-A", "test-member-B"]     # temporary test members, removed in Cell 22
 
-rows = []
-for athlete, program, missed in [("test-member-A", PROGRAM_A, MISSED_A), ("test-member-B", PROGRAM_B, set())]:
+def program_rows(uid, program, missed, start):
+    """Four weeks of logged sets for one member, following a program (all values invented)."""
+    out = []
     for w in range(WEEKS):
         for ex, (session, day, sets, reps, kg, rpe) in program.items():
-            day_str = (DATA_START + pd.Timedelta(weeks=w, days=DAY[day])).date().isoformat()
+            day_str = (start + pd.Timedelta(weeks=w, days=DAY[day])).date().isoformat()
             done = (w, day) not in missed
-            for s in range(1, sets + 1):
-                got = reps - 2 if (rpe[w] >= 9.5 and s == sets) else reps
-                rows.append({"date": day_str, "athlete_id": athlete, "session": session,
-                             "exercise": ex, "set_no": s, "target_reps": reps,
-                             "reps": got if done else 0, "weight_kg": kg[w],
-                             "rpe": rpe[w] if done else None, "completed": done})
+            for s_ in range(1, sets + 1):
+                got = reps - 2 if (rpe[w] >= 9.5 and s_ == sets) else reps
+                out.append({"date": day_str, "athlete_id": uid, "session": session,
+                            "exercise": ex, "set_no": s_, "target_reps": reps,
+                            "reps": got if done else 0, "weight_kg": kg[w],
+                            "rpe": rpe[w] if done else None, "completed": done})
+    return out
 
+
+def sample_metrics(uid, start, watch):
+    """Four weeks of daily check-ins. With a watch: HRV and resting heart rate too; the last
+    3 days show short sleep, so the rest score is not green."""
+    out = []
+    for d in range(WEEKS * 7):
+        day_str = (start + pd.Timedelta(days=d)).date().isoformat()
+        late = d >= WEEKS * 7 - 3
+        if watch:
+            out.append({"date": day_str, "athlete_id": uid,
+                        "sleep_hours": 6.2 if late else round(7.4 + 0.3 * ((d % 3) - 1), 1),
+                        "resting_hr": 58 if late else 55 + (d % 2),
+                        "hrv_ms": 60 if late else 66 + (d % 4) - 2,
+                        "soreness_1_5": 3 if late else 2})
+        else:
+            out.append({"date": day_str, "athlete_id": uid,
+                        "sleep_hours": round(7.6 + 0.2 * ((d % 2) - 0.5), 1), "resting_hr": None,
+                        "hrv_ms": None, "soreness_1_5": 2})
+    return out
+
+
+rows = program_rows("test-member-A", PROGRAM_A, MISSED_A, DATA_START) + \
+    program_rows("test-member-B", PROGRAM_B, set(), DATA_START)
 
 def write_keeping_users(new_df, path):
     """Rewrite the test members' rows but keep rows logged by real app users."""
@@ -268,21 +295,10 @@ def write_keeping_users(new_df, path):
     new_df.to_csv(path, index=False)
 
 
-# Recovery data. Member A wears a watch (HRV, resting HR); the last 3 days show short
-# sleep, so today's readiness is not green. Member B has no watch (sleep + soreness only).
+# Recovery data. Member A wears a watch (HRV, resting HR); member B has no watch.
 metrics = []
-for d in range(WEEKS * 7):
-    day_str = (DATA_START + pd.Timedelta(days=d)).date().isoformat()
-    late = d >= WEEKS * 7 - 3
-    metrics.append({"date": day_str, "athlete_id": "test-member-A",
-                    "sleep_hours": 6.2 if late else round(7.4 + 0.3 * ((d % 3) - 1), 1),
-                    "resting_hr": 58 if late else 55 + (d % 2),
-                    "hrv_ms": 60 if late else 66 + (d % 4) - 2,
-                    "soreness_1_5": 3 if late else 2})
-    metrics.append({"date": day_str, "athlete_id": "test-member-B",
-                    "sleep_hours": round(7.6 + 0.2 * ((d % 2) - 0.5), 1), "resting_hr": None,
-                    "hrv_ms": None, "soreness_1_5": 2})
-
+for _a, _b in zip(sample_metrics("test-member-A", DATA_START, True), sample_metrics("test-member-B", DATA_START, False)):
+    metrics += [_a, _b]
 
 def write_test_history():
     """(Re)write the test members' invented workouts and check-ins; real members' rows are kept."""
@@ -685,6 +701,11 @@ def get_user(user_id):
     return dict(row) if row else None
 
 
+def member_name(uid):
+    p, u = get_profile(uid) or {}, get_user(uid) or {}
+    return p.get("display_name") or u.get("name") or "a former member"
+
+
 def create_test_member(user_id, name, *profile):
     """A temporary member used only by the tests. Random password: nobody can sign in as it."""
     with db() as conn:
@@ -1008,6 +1029,24 @@ class MemoryGateway:
                                              "source": source})
         return "corrected" if old else "created"
 
+    # ---------- a member's other private spaces: plans, check-ins, saved workouts ----------
+    @staticmethod
+    def space(owner, kind):
+        return ("athletes", owner, kind)
+
+    def private_put(self, actor, owner, kind, key, value):
+        self.check(actor, "write_private", owner, f"{owner}/{kind}/{key}")
+        self.store.put(self.space(owner, kind), key, value)
+
+    def private_get(self, actor, owner, kind, key):
+        self.check(actor, "read_private", owner, f"{owner}/{kind}/{key}")
+        item = self.store.get(self.space(owner, kind), key)
+        return item.value if item else None
+
+    def private_list(self, actor, owner, kind):
+        self.check(actor, "read_private", owner, f"{owner}/{kind}")
+        return [i.value for i in self.store.search(self.space(owner, kind), limit=500)]
+
     # ---------- shared library ----------
     def _all_records(self):
         return [i.value for i in self.store.search(self.LIB, limit=500)]
@@ -1043,6 +1082,8 @@ class MemoryGateway:
                  "equipment": rec["equipment"], "level": rec.get("level", "beginner"),
                  "exercises": list(rec["exercises"]), "author": author, "proposed_by": actor[0],
                  "status": "pending", "superseded_by": None, "why": rec.get("why", ""),
+                 "notes": rec.get("notes", ""), "performed_on": rec.get("performed_on"),
+                 "result": rec.get("result", ""), "plan_day": rec.get("plan_day"), "shared_at": None,
                  "created_at": now.isoformat(timespec="seconds"),
                  "review_after": (now + pd.Timedelta(days=REVIEW_DAYS)).date().isoformat(),
                  "history": [f"{now:%d %b}: proposed by {actor[0].replace('_', ' ')}"]}
@@ -1056,14 +1097,20 @@ class MemoryGateway:
             recs = [r for r in recs if r["version"] == version]
         return max(recs, key=lambda r: r["version"]) if recs else None
 
-    def library_decide(self, actor, rid, approve):
-        """Only the author decides whether a pending record is published."""
+    def library_decide(self, actor, rid, approve, edits=None):
+        """Only the author decides whether a pending record is published. The author may edit the
+        title, exercises and add notes for other members before sharing."""
         rec = self._get(rid)
         if not rec:
             return "missing"
         self.check(actor, "decide_share", rec["author"], f"{rid} v{rec['version']}")
         if approve:
+            changed = {k: v for k, v in (edits or {}).items() if k in ("title", "exercises", "notes") and v and v != rec.get(k)}
+            if changed:
+                rec.update(changed)
+                rec["history"].append(f"{datetime.now():%d %b}: edited by the author before sharing ({', '.join(changed)})")
             rec["status"] = "approved"
+            rec["shared_at"] = datetime.now().isoformat(timespec="seconds")
             rec["history"].append(f"{datetime.now():%d %b}: approved by the author")
             self.store.put(self.LIB, f"{rid}-v{rec['version']}", rec)
             self.log(actor, "decide_share", f"{rid} v{rec['version']}", True, "approved -> published")
@@ -1224,11 +1271,14 @@ Profile already stored: {profile}
 Message: {request}
 
 Return JSON only, no code fence:
-{{"wants_plan": true, "pain_or_injury": false, "this_week_notes": "",
-  "profile_updates": [{{"key": "...", "value": "..."}}]}}
+{{"wants_plan": true, "asks_question": false, "topic": "training", "pain_or_injury": false,
+  "this_week_notes": "", "profile_updates": [{{"key": "...", "value": "..."}}]}}
 
 Rules:
 - wants_plan: true if they ask for a training plan, a change to one, or how they are progressing.
+- asks_question: true if they ask for advice or information that is NOT a training plan: a meal plan,
+  what to eat, protein, sleep, recovery, technique, motivation, or anything else.
+- topic: "training", "nutrition", "recovery" or "other" (for questions not about fitness or health habits).
 - pain_or_injury: true if they mention pain, injury, illness or a medical condition.
 - this_week_notes: constraints for next week only. Empty if none.
 - profile_updates: lasting facts the member stated about themselves, using ONLY these keys:
@@ -1253,8 +1303,12 @@ def understand_request(state: PlanState) -> PlanState:
     profile = {k: v["value"] for k, v in state.get("memories", {}).items()}
     u = parse_json(llm.invoke(UNDERSTAND_PROMPT.format(profile=json.dumps(profile), request=state["request"])).content)
     u = {"wants_plan": bool(u.get("wants_plan", True)), "pain_or_injury": bool(u.get("pain_or_injury", False)),
+         "asks_question": bool(u.get("asks_question", False)), "topic": str(u.get("topic") or "training"),
          "this_week_notes": str(u.get("this_week_notes", "") or ""), "profile_updates": u.get("profile_updates", []) or []}
-    print(f"  [understand_request] wants_plan={u['wants_plan']} pain={u['pain_or_injury']} updates={len(u['profile_updates'])}")
+    if u["asks_question"] and u["wants_plan"] and u["topic"] in ("nutrition", "other"):
+        u["wants_plan"] = False            # "give me a meal plan" is a question, not a training plan
+    print(f"  [understand_request] wants_plan={u['wants_plan']} question={u['asks_question']} topic={u['topic']} "
+          f"pain={u['pain_or_injury']} updates={len(u['profile_updates'])}")
     return {"understanding": u}
 
 
@@ -1274,12 +1328,16 @@ def update_memory(state: PlanState) -> PlanState:
 # ==========================================================================
 # Cell 12 - Route 1: what kind of request is this?
 # ==========================================================================
-# > pain -> safety reply | no plan wanted -> acknowledge | no history -> starter week |
-# > otherwise -> the Progress Checker. Decided BEFORE any data is read.
-def route_request(state: PlanState) -> Literal["safety_response", "acknowledge", "starter_setup", "progress_analyst"]:
+# > pain or a medical condition -> safety reply | a question (meal plan, sleep, recovery...) -> coach
+# > answer | no plan wanted -> acknowledge | no history -> starter week | otherwise -> the Progress
+# > Checker. Decided BEFORE any data is read.
+def route_request(state: PlanState) -> Literal["safety_response", "coach_answer", "acknowledge", "starter_setup",
+                                               "progress_analyst"]:
     u = state["understanding"]
     if u["pain_or_injury"]:
         route = "safety_response"
+    elif not u["wants_plan"] and u.get("asks_question"):
+        route = "coach_answer"
     elif not u["wants_plan"]:
         route = "acknowledge"
     else:
@@ -1290,8 +1348,9 @@ def route_request(state: PlanState) -> Literal["safety_response", "acknowledge",
 
 
 def safety_response(state: PlanState) -> PlanState:
-    msg = ("You mentioned pain or an injury, so I won't build a training plan around it. Please get it checked "
-           "by a physiotherapist or doctor first, then tell me what you are cleared to do and I'll plan from there.")
+    msg = ("You mentioned pain, an injury or a medical condition, so I won't plan or advise around it. Please check "
+           "with a doctor, physiotherapist or registered dietitian first, then tell me what you are cleared to do "
+           "and I'll plan from there.")
     print("  [safety_response] fixed safety reply")
     return {"status": "safety_stop", "route": "safety_response", "reply": msg}
 
@@ -1300,6 +1359,42 @@ def acknowledge(state: PlanState) -> PlanState:
     print("  [acknowledge] profile updated, no plan requested")
     return {"status": "profile_updated", "route": "acknowledge",
             "reply": "Got it, I've updated your profile. Ask me whenever you want next week's plan."}
+
+
+COACH_PROMPT = """You are FitPlan's coach. A gym member asked a question that is not a training-plan request.
+Answer it helpfully and briefly (under 220 words), in plain words, using markdown bullets or a small table if useful.
+
+What you know about the member (use it to personalise):
+Profile: {profile}
+Body details (only if the member allowed it): {member}
+Training last week: {training}
+
+Rules:
+- You may answer about nutrition and meal plans, protein, hydration, sleep, recovery, warm-ups, technique,
+  motivation and general fitness. A meal plan = one example day (breakfast, lunch, dinner, snacks) with
+  everyday foods and rough portions, matched to their goal.
+- Never give medical advice, never suggest extreme diets, fasting protocols, supplements beyond basics
+  (protein powder, creatine), or calorie targets below what a healthy adult needs. Never comment on body weight.
+- If the question mentions a medical condition, allergy, pregnancy, medication or disordered eating, say kindly
+  that a doctor or registered dietitian should guide this, and keep any tips general.
+- If the question is not about fitness, food, sleep or health habits, reply in one sentence that you are a
+  fitness coach and suggest what you can help with.
+- End with one short line offering a related next step in FitPlan (for example, planning next week).
+
+Question: {question}"""
+
+
+def coach_answer(state: PlanState) -> PlanState:
+    """Questions that are not plan requests: meal plans, protein, sleep, recovery, general fitness."""
+    uid = state["athlete_id"]
+    profile = {k: v["value"] for k, v in state.get("memories", {}).items()}
+    with contextlib.redirect_stdout(io.StringIO()):
+        h = get_training_history.invoke({"athlete_id": uid})
+    training = {k: h.get(k) for k in ["sessions_planned", "sessions_completed", "volume_last_week_kg"]} if h.get("has_history") else "none logged"
+    text = llm.invoke(COACH_PROMPT.format(profile=json.dumps(profile), member=json.dumps(state.get("member") or {}),
+                                          training=json.dumps(training), question=state["request"])).content
+    print(f"  [coach_answer] topic={state['understanding'].get('topic')} -> answered ({len(text.split())} words), nothing stored")
+    return {"status": "answered", "route": "coach_answer", "reply": text.strip()}
 
 
 def starter_setup(state: PlanState) -> PlanState:
@@ -1495,6 +1590,16 @@ def quiet_targets(uid):
         return get_progression_targets.invoke({"athlete_id": uid})
 
 
+def saved_for_planner(state):
+    """The member's own saved copies of community workouts (the planner reads them FOR the member)."""
+    try:
+        recs = gateway.private_list(("planner", state["session_user"]), state["athlete_id"], "saved_workouts")
+    except AccessDenied:
+        return []
+    return [{"title": r["title"], "exercises": r["exercises"], "notes": r.get("my_notes") or r.get("notes", "")}
+            for r in recs][:5]
+
+
 def planner(state: PlanState) -> PlanState:
     CURRENT_ACTOR["planner"] = ("planner", state["session_user"])
     msgs, new = state.get("messages", []), []
@@ -1504,6 +1609,7 @@ def planner(state: PlanState) -> PlanState:
                  f"Long-term profile (memory): {json.dumps(profile)}\n"
                  f"Member details (shared with consent): {json.dumps(state.get('member') or {})}\n"
                  f"ProgressReport from the Progress Checker: {json.dumps(state.get('progress_report') or {})}\n"
+                 f"Community workouts the member saved to their profile: {json.dumps(saved_for_planner(state))}\n"
                  f"Notes for next week only: {state['understanding']['this_week_notes'] or 'none'}\n"
                  f"Member's message: {state['request']}")
         new = [SystemMessage(PLANNER_SYSTEM), HumanMessage(brief)]
@@ -1576,6 +1682,9 @@ def revise(state: PlanState) -> PlanState:
 def save_plan(state: PlanState) -> PlanState:
     CALENDAR[state["athlete_id"]] = {"saved_at": datetime.now().isoformat(timespec="seconds"), "plan": state["plan"]}
     store.put(("calendar", state["athlete_id"]), "next_week", CALENDAR[state["athlete_id"]])
+    rec = make_plan_record(state["plan"])                    # the 7 dated days the member checks off later
+    gateway.private_put(("member", state["session_user"]), state["athlete_id"], "plans", rec["plan_id"], rec)
+    print(f"  [save_plan] plan {rec['plan_id']} for the week of {rec['week_start']} saved to My calendar")
     print(f"  [save_plan] SIMULATION: plan written to {state['athlete_id']}'s calendar")
     return {"status": "saved"}
 
@@ -1606,14 +1715,237 @@ def finalize(state: PlanState) -> PlanState:
 
 
 # ==========================================================================
+# Cell 15b - My calendar: daily check-in, the day's result, sharing a day, saving community workouts
+# ==========================================================================
+# > NEW. A saved plan becomes 7 dated days in the member's private space ("athletes", id, "plans").
+# > Each day the member checks in (sleep, soreness, effort) and ticks every exercise done or not done.
+# > FitPlan writes those sets to the workout log (so next week's Progress Checker sees them), works out
+# > the day's rest score, and shows the result. The Progress Checker then PROPOSES sharing the workout;
+# > the member can edit it and add notes before it is published. Other members can save a shared
+# > workout into their own private space ("athletes", id, "saved_workouts") and edit their copy.
+import sys
+from datetime import timedelta
+
+LIB_NAMES = sorted(pd.read_csv(LIB_PATH)["exercise"], key=len, reverse=True)
+SETS_REPS = re.compile(r"(\d+)\s*[x×]\s*(\d+)")
+KG = re.compile(r"@\s*(\d+(?:\.\d+)?)\s*kg", re.I)
+ECHO_LOGS = True             # also write agent steps to the server log (Render / Colab output)
+
+
+def server_log(text, prefix=""):
+    """Write captured agent steps to the real server log, even while the app captures stdout."""
+    if not ECHO_LOGS or not text:
+        return
+    for line in str(text).strip().splitlines():
+        if line.strip():
+            print(f"{prefix}{line}", file=sys.__stdout__, flush=True)
+
+
+def parse_item(text):
+    """'Barbell bench press 3x6 @ 85 kg' -> name, sets, reps, kg (name matched to the exercise library)."""
+    t = re.sub(r"[*_`]", "", str(text)).strip(" -•·")
+    low = t.lower()
+    if low.startswith("library:"):
+        return {"label": t, "name": t, "sets": None, "reps": None, "kg": None, "library": True}
+    m, kg = SETS_REPS.search(low), KG.search(low)
+    name = next((n for n in LIB_NAMES if n in low), (low[:m.start()] if m else low).strip(" :-–—,"))
+    return {"label": t, "name": name, "sets": int(m.group(1)) if m else None, "reps": int(m.group(2)) if m else None,
+            "kg": float(kg.group(1)) if kg else None, "library": False}
+
+
+def next_monday(today=None):
+    t = today or date.today()
+    return t + timedelta(days=7 - t.weekday())
+
+
+def make_plan_record(plan_md, today=None):
+    """The approved plan as 7 dated days for next week."""
+    start = next_monday(today)
+    found = {}
+    for cells in plan_rows(plan_md):
+        i = next((k for k, d in enumerate(DAY_NAMES) if cells[0].lower().strip("* ").startswith(d[:3])), None)
+        if i is not None:
+            found[i] = cells
+    days = []
+    for i, name in enumerate(DAYS):
+        cells = found.get(i)
+        session, ex, report = (cells[1], cells[2], cells[3]) if cells else ("Rest", "", "")
+        rest = (not cells) or bool(re.search(r"\b(rest|off)\b", session.lower())) or ex.strip() in ("", "-", "—")
+        items = [] if rest else [parse_item(x) for x in re.split(r"\s*[;•·\n]\s*", ex) if x.strip() not in ("", "-", "—")]
+        days.append({"day": name, "date": (start + timedelta(days=i)).isoformat(), "session": session,
+                     "rest": rest, "items": items, "report": report, "checkin": None})
+    now = datetime.now()
+    return {"plan_id": f"plan-{now:%Y%m%d-%H%M%S}-{secrets.token_hex(2)}", "saved_at": now.isoformat(timespec="seconds"),
+            "week_start": start.isoformat(), "week_end": (start + timedelta(days=6)).isoformat(),
+            "days": days, "plan_md": plan_md}
+
+
+def list_plans(uid):
+    plans = gateway.private_list(("member", uid), uid, "plans")
+    return sorted(plans, key=lambda p: p["saved_at"], reverse=True)
+
+
+def readiness_on(uid, day_iso):
+    """The rest score for one day, against the member's own earlier days."""
+    m = pd.read_csv(METRICS_PATH)
+    m = m[m["athlete_id"] == uid].sort_values("date")
+    row = m[m["date"] == day_iso]
+    if row.empty:
+        return None, None
+    base = m[m["date"] < day_iso].tail(28)
+    base = base if not base.empty else row
+    score = readiness_score(row.iloc[-1], _num(base["hrv_ms"].mean()), _num(base["resting_hr"].mean()))
+    return score, ("green" if score >= 67 else "yellow" if score >= 34 else "red")
+
+
+def complete_day(uid, plan_id, idx, done_labels, sleep, soreness, rhr=None, hrv=None, rpe=8):
+    """Save a day's check-in and ticks. Returns (result, proposed record id or None, message)."""
+    me = ("member", uid)
+    plan = gateway.private_get(me, uid, "plans", plan_id)
+    if not plan:
+        return None, None, "That plan was not found."
+    day = plan["days"][idx]
+    try:
+        sleep, soreness, rpe = float(sleep), float(soreness), float(rpe)
+    except (TypeError, ValueError):
+        return None, None, "Please enter your sleep hours and soreness."
+    if not (0 <= sleep <= 16) or not (1 <= soreness <= 5):
+        return None, None, "Sleep should be 0-16 hours and soreness 1-5."
+    done_labels = [l for l in (done_labels or []) if any(l == it["label"] for it in day["items"])]
+    m = pd.read_csv(METRICS_PATH)
+    m = m[~((m["athlete_id"] == uid) & (m["date"] == day["date"]))]
+    pd.concat([m, pd.DataFrame([{"date": day["date"], "athlete_id": uid, "sleep_hours": sleep, "soreness_1_5": soreness,
+                                 "resting_hr": _num(rhr), "hrv_ms": _num(hrv)}])], ignore_index=True).to_csv(METRICS_PATH, index=False)
+    log = pd.read_csv(LOG_PATH)
+    log = log[~((log["athlete_id"] == uid) & (log["date"] == day["date"]))]
+    sets_rows = []
+    for it in day["items"]:
+        done = it["label"] in done_labels
+        if it["sets"] and it["reps"]:
+            for s_ in range(1, it["sets"] + 1):
+                sets_rows.append({"date": day["date"], "athlete_id": uid, "session": re.sub(r"\s*\(.*?\)", "", day["session"]),
+                                  "exercise": it["name"], "set_no": s_, "target_reps": it["reps"],
+                                  "reps": it["reps"] if done else 0, "weight_kg": it["kg"] or 0.0,
+                                  "rpe": rpe if done else None, "completed": done})
+    pd.concat([log, pd.DataFrame(sets_rows)], ignore_index=True).to_csv(LOG_PATH, index=False)
+    score, zone = readiness_on(uid, day["date"])
+    d0, total = date.fromisoformat(day["date"]), len(day["items"])
+    result = {"date": day["date"], "weekday": day["day"], "nice_date": d0.strftime("%A %d %B %Y"),
+              "iso_week": d0.isocalendar()[1], "plan_week": plan["week_start"], "readiness": score, "zone": zone,
+              "done": len(done_labels), "total": total, "pct": round(100 * len(done_labels) / total) if total else 0,
+              "done_labels": done_labels, "sleep": sleep, "soreness": soreness, "rpe": rpe,
+              "saved_at": datetime.now().isoformat(timespec="seconds")}
+    day["checkin"] = result
+    gateway.private_put(me, uid, "plans", plan_id, plan)
+    gateway.log(me, "daily_checkin", f"{uid}/plans/{day['date']}", True,
+                f"{len(done_labels)}/{total} done, readiness {score}, {len(sets_rows)} sets logged")
+    rid = None
+    if done_labels and (get_profile(uid) or {}).get("share_suggestions"):
+        rid = suggest_day_share(uid, plan_id, idx, "progress_analyst")
+    return result, rid, ""
+
+
+DAY_SHARE_PROMPT = """You are the Progress Checker in a gym coaching team. A member just finished this workout:
+session: {session}; date: {date}; exercises done: {exercises}; result: {result}.
+Suggest sharing it with the community. Return JSON only, no code fence:
+{{"title": "a short, clear workout name (max 6 words)", "why": "one friendly sentence on why others might like it"}}"""
+
+
+def suggest_day_share(uid, plan_id, idx, role="progress_analyst"):
+    """The Progress Checker (or the member) proposes the day's workout for the community: saved as PENDING."""
+    plan = gateway.private_get(("member", uid), uid, "plans", plan_id)
+    day, key = plan["days"][idx], f"{plan_id}:{idx}"
+    for r in gateway.library_all(("member", uid)):
+        if r.get("plan_day") == key and r["status"] in ("pending", "approved"):
+            return r["record_id"]
+    ck = day.get("checkin") or {}
+    done = [it for it in day["items"] if it["label"] in ck.get("done_labels", []) and not it.get("library")]
+    if not done:
+        return None
+    exercises = [f"{it['name']} x {it['sets']}x{it['reps']}" if it["sets"] else it["name"] for it in done]
+    result = f"{ck.get('done')} of {ck.get('total')} exercises done, rest score {ck.get('readiness')}"
+    out = parse_json(llm.invoke(DAY_SHARE_PROMPT.format(session=day["session"], date=day["date"],
+                                                        exercises="; ".join(exercises), result=result)).content)
+    title = str(out.get("title") or f"{re.sub(r'[(].*?[)]', '', day['session']).strip()} workout").strip()[:60]
+    lib = pd.read_csv(LIB_PATH).set_index("exercise")
+    eq = sorted({lib.loc[it["name"], "equipment"] for it in done if it["name"] in lib.index})
+    equipment = "bodyweight" if eq == ["bodyweight"] else "dumbbell" if eq and set(eq) <= {"dumbbell", "bodyweight"} else "machine"
+    prof = get_profile(uid) or {}
+    rid = gateway.library_propose((role, uid), uid, {
+        "title": title, "minutes": 7 * len(done) + 5, "equipment": equipment,
+        "level": str(prof.get("experience_level") or "beginner").lower(), "exercises": exercises,
+        "why": str(out.get("why") or "finished it today"), "performed_on": day["date"], "result": result, "plan_day": key})
+    print(f"  [progress_analyst] suggested sharing {day['day']}'s workout as '{title}' ({rid}, pending)")
+    return rid
+
+
+def save_copy(uid, rid):
+    """A member saves someone else's shared workout into their OWN private space. The original is unchanged."""
+    me = ("member", uid)
+    rec = next((r for r in gateway.library_search(me, "any") if r["record_id"] == rid), None)
+    if not rec:
+        return "That workout can't be saved: it is not ready to use (out of date or not shared)."
+    if rec["author"] == uid:
+        return "This is your own workout. It is already yours."
+    copy = {"record_id": rid, "title": rec["title"], "exercises": list(rec["exercises"]), "notes": rec.get("notes", ""),
+            "author": rec["author"], "source_version": rec["version"], "my_version": 1, "my_notes": "",
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "history": [f"{datetime.now():%d %b}: saved from {member_name(rec['author'])}'s version {rec['version']}"]}
+    gateway.private_put(me, uid, "saved_workouts", rid, copy)
+    gateway.log(me, "save_copy", f"{rid} v{rec['version']} -> {uid}/saved_workouts", True, "private copy; original unchanged")
+    return f"Saved “{rec['title']}” to your workouts. Your AI team can now use it in your plans."
+
+
+def update_copy(uid, rid, exercises, my_notes):
+    """The member edits THEIR copy; each edit is a new version of the copy."""
+    me = ("member", uid)
+    copy = gateway.private_get(me, uid, "saved_workouts", rid)
+    if not copy:
+        return "That saved workout was not found."
+    exs = [l.strip() for l in (exercises or "").splitlines() if l.strip()]
+    if not exs:
+        return "Please list at least one exercise."
+    copy.update(exercises=exs, my_notes=(my_notes or "").strip(), my_version=copy["my_version"] + 1)
+    copy["history"].append(f"{datetime.now():%d %b}: you edited your copy (version {copy['my_version']})")
+    gateway.private_put(me, uid, "saved_workouts", rid, copy)
+    gateway.log(me, "update_copy", f"{uid}/saved_workouts/{rid}", True, f"my version {copy['my_version']}")
+    return f"Saved your version {copy['my_version']}. The original in the community did not change."
+
+
+def list_copies(uid):
+    return sorted(gateway.private_list(("member", uid), uid, "saved_workouts"), key=lambda c: c["saved_at"], reverse=True)
+
+
+def load_sample_history(uid):
+    """Give a NEW member 4 weeks of invented workouts and check-ins that end last week."""
+    log = pd.read_csv(LOG_PATH)
+    if (log["athlete_id"] == uid).any():
+        return "You already have workouts, so no sample data was added."
+    prof = get_profile(uid) or {}
+    advanced = str(prof.get("experience_level", "")).lower() in ("intermediate", "advanced")
+    start = date.today() - timedelta(days=date.today().weekday()) - timedelta(weeks=WEEKS)
+    start = pd.Timestamp(start)
+    new = program_rows(uid, PROGRAM_A if advanced else PROGRAM_B, MISSED_A if advanced else set(), start)
+    pd.concat([log, pd.DataFrame(new)], ignore_index=True).to_csv(LOG_PATH, index=False)
+    m = pd.read_csv(METRICS_PATH)
+    m = m[m["athlete_id"] != uid]
+    pd.concat([m, pd.DataFrame(sample_metrics(uid, start, bool(prof.get("has_watch"))))], ignore_index=True).to_csv(METRICS_PATH, index=False)
+    gateway.log(("member", uid), "load_sample_history", f"{uid}/workouts", True, f"{len(new)} invented sets")
+    return f"Added 4 weeks of sample workouts ({len(new)} sets, all made up) ending last week."
+
+
+print("My calendar ready. Plan parsing example:", parse_item("Barbell Bench Press 3x6 @ 85 kg"))
+
+
+# ==========================================================================
 # Cell 16 - Build the graph with the SQLite checkpointer
 # ==========================================================================
-# > 15 nodes, 4 conditional routes (request type, planner loop, member decision, share needed?). Conversations are checkpointed in fitplan_checkpoints.db.
+# > 16 nodes, 4 conditional routes (request type, planner loop, member decision, share needed?). Conversations are checkpointed in fitplan_checkpoints.db.
 def build_app(checkpoint_path=CHECKPOINT_DB, the_store=None):
     b = StateGraph(PlanState)
     for name, fn in [("load_memory", load_memory), ("understand_request", understand_request),
                      ("update_memory", update_memory), ("safety_response", safety_response),
-                     ("acknowledge", acknowledge), ("starter_setup", starter_setup),
+                     ("acknowledge", acknowledge), ("coach_answer", coach_answer), ("starter_setup", starter_setup),
                      ("progress_analyst", progress_analyst), ("planner", planner), ("tools", ToolNode(plan_tools)),
                      ("human_approval", human_approval), ("revise", revise), ("save_plan", save_plan),
                      ("not_saved", not_saved), ("approve_share", approve_share), ("finalize", finalize)]:
@@ -1622,7 +1954,7 @@ def build_app(checkpoint_path=CHECKPOINT_DB, the_store=None):
     b.add_edge("load_memory", "understand_request")
     b.add_edge("understand_request", "update_memory")
     b.add_conditional_edges("update_memory", route_request,
-                            ["safety_response", "acknowledge", "starter_setup", "progress_analyst"])
+                            ["safety_response", "coach_answer", "acknowledge", "starter_setup", "progress_analyst"])
     b.add_edge("starter_setup", "planner")
     b.add_edge("progress_analyst", "planner")                 # the HAND-OFF
     b.add_conditional_edges("planner", route_after_planner, ["tools", "planner", "human_approval"])
@@ -1632,7 +1964,7 @@ def build_app(checkpoint_path=CHECKPOINT_DB, the_store=None):
     b.add_conditional_edges("save_plan", route_after_plan, ["approve_share", "finalize"])
     b.add_conditional_edges("not_saved", route_after_plan, ["approve_share", "finalize"])
     b.add_edge("approve_share", "finalize")
-    for n in ["safety_response", "acknowledge"]:
+    for n in ["safety_response", "acknowledge", "coach_answer"]:
         b.add_edge(n, "finalize")
     b.add_edge("finalize", END)
     saver = SqliteSaver(sqlite3.connect(checkpoint_path, check_same_thread=False))
@@ -1693,8 +2025,9 @@ def remove_test_members():
             conn.execute(f"DELETE FROM {t} WHERE user_id LIKE 'test-member-%'")
         conn.execute("DELETE FROM emails WHERE to_email LIKE '%@fitplan.test'")
     for uid in ids:
-        for item in store.search(("athletes", uid, "profile"), limit=1000):
-            store.delete(("athletes", uid, "profile"), item.key)
+        for kind in ["profile", "plans", "saved_workouts"]:
+            for item in store.search(("athletes", uid, kind), limit=1000):
+                store.delete(("athletes", uid, kind), item.key)
         store.delete(("calendar", uid), "next_week")
     for item in store.search(("shared", "library"), limit=1000):
         if is_test_member(item.value.get("author")):
@@ -2119,6 +2452,7 @@ STEP_WORDS = {
     "tools": ("Looked up your targets and the community library", "Plan Coach"),
     "safety_response": ("Paused planning because you mentioned pain", "Safety"),
     "acknowledge": ("Saved your update. No plan needed", "FitPlan"),
+    "coach_answer": ("Answered your question", "Coach"),
     "starter_setup": ("No workouts yet, so a gentle starter week", "Plan Coach"),
     "revise": ("Reworking the plan with your request", "Plan Coach"),
     "human_approval": ("Recorded your decision", "You"),
@@ -2179,7 +2513,8 @@ def record_key(r):
 
 def community_choices(uid, filt="All"):
     want = FILTERS.get(filt)
-    recs = sorted(gateway.library_all(("member", uid)), key=lambda r: (r["record_id"], -r["version"]))
+    recs = sorted(gateway.library_all(("member", uid)), key=lambda r: (r.get("shared_at") or r["created_at"], r["version"]),
+                  reverse=True)                     # newest first
     out = []
     for r in recs:
         if want and r["status"] != want:
@@ -2211,6 +2546,9 @@ def record_html(uid, key, tech=False):
     return (f"<div class='panel'><span class='badge' style='background:{bg};color:{fg}'>{label}</span>"
             f"<h3 style='margin:10px 0 6px'>{esc(rec['title'])} <span style='color:#5B6B82;font-weight:400;font-size:14px'>version {rec['version']}</span></h3>"
             f"<div style='font-size:14px;line-height:1.6'>{exs}</div>"
+            + (f"<div class='tips'><b>Tips from {esc(author)}:</b> {esc(rec['notes'])}</div>" if rec.get("notes") else "")
+            + (f"<div style='color:#5B6B82;font-size:13px;margin-top:6px'>Done on {esc(rec['performed_on'])}: {esc(rec.get('result', ''))}</div>"
+               if rec.get("performed_on") else "") +
             f"<div class='kv'><div><span>Shared by</span>{esc(author)}</div><div><span>Idea came from</span>{esc(from_)}</div>"
             f"<div><span>Can AI plans use it?</span>{usable}</div><div><span>About</span>{rec['minutes']} min · {esc(rec['equipment'])} · {esc(rec['level'])}</div></div>"
             f"<b style='font-size:13px;color:#5B6B82'>HISTORY</b><ul class='hist'>{hist}</ul>"
@@ -2223,11 +2561,6 @@ def pending_for(uid):
 
 
 # ---------------- Privacy ----------------
-def member_name(uid):
-    p, u = get_profile(uid) or {}, get_user(uid) or {}
-    return p.get("display_name") or u.get("name") or "a former member"
-
-
 def other_members(uid):
     """Every other real member, most recently signed in first (test members are never listed)."""
     with db() as conn:
@@ -2421,6 +2754,203 @@ def restart_table(before, after):
             f"<th>Before closing</th><th>After reopening</th><th>Same?</th></tr></thead><tbody>{body}</tbody></table></div>")
 
 
+# ---------------- My calendar ----------------
+ZONE_COL = {"green": "#16A34A", "yellow": "#D97706", "red": "#DC2626", None: "#94A3B8"}
+
+
+def plan_label(p):
+    a, b_ = date.fromisoformat(p["week_start"]), date.fromisoformat(p["week_end"])
+    done = sum(1 for d in p["days"] if d.get("checkin"))
+    return f"Week of {a:%d %b} to {b_:%d %b %Y}  ·  {done} of {sum(1 for d in p['days'] if not d['rest'])} days checked"
+
+
+def day_label(d):
+    return f"{date.fromisoformat(d['date']):%a %d %b}  ·  {re.sub(r'[*]', '', d['session'])}"
+
+
+def week_html(p):
+    if not p:
+        return ("<div class='panel' style='color:#5B6B82'>No saved plan yet. Go to the <b>Dashboard</b>, ask for a plan "
+                "and press <b>Save to my calendar</b>. It will appear here as 7 days you can check off.</div>")
+    cards = ""
+    for d in p["days"]:
+        ck = d.get("checkin")
+        if d["rest"]:
+            chip, col = "Rest day", "#94A3B8"
+        elif not ck:
+            chip, col = "Not checked yet", "#2563EB"
+        else:
+            chip = f"Done {ck['done']} of {ck['total']}"
+            col = "#16A34A" if ck["done"] == ck["total"] else "#D97706"
+        score = (f"<div class='mini' style='color:{ZONE_COL[ck.get('zone')]}'>Rest score {ck['readiness']}</div>" if ck else "")
+        cards += (f"<div class='wday' style='border-top:4px solid {col}'><div class='wd'>{date.fromisoformat(d['date']):%a}</div>"
+                  f"<div class='wdate'>{date.fromisoformat(d['date']):%d %b}</div><div class='wsess'>{esc(re.sub(r'[*]', '', d['session']))}</div>"
+                  f"<div class='wchip' style='color:{col}'>{chip}</div>{score}</div>")
+    return f"<div class='week'>{cards}</div>"
+
+
+def day_head_html(d):
+    if d["rest"]:
+        return (f"<div class='panel'><h3 style='margin:0'>{date.fromisoformat(d['date']):%A %d %B} is a rest day</h3>"
+                "<div style='color:#5B6B82'>Recover, walk and stretch. You can still save a check-in for your sleep and soreness.</div></div>")
+    exs = "".join(f"<li>{esc(it['label'])}</li>" for it in d["items"])
+    return (f"<div class='panel'><h3 style='margin:0 0 4px'>{date.fromisoformat(d['date']):%A %d %B}: {esc(re.sub(r'[*]', '', d['session']))}</h3>"
+            f"<div style='color:#5B6B82;font-size:14px'>Today's workout. Tick each exercise you did below, then save your day.</div>"
+            f"<ul style='margin:8px 0 0 0'>{exs}</ul></div>")
+
+
+def day_result_html(ck):
+    if not ck:
+        return ""
+    col = ZONE_COL[ck.get("zone")]
+    words = {"green": "Well rested", "yellow": "A bit tired", "red": "Tired, take it easy"}.get(ck.get("zone"), "")
+    bar = ck["pct"]
+    return (f"<div class='result-card'><div class='rc-l'><div class='ring' style='border-color:{col}'>{ck['readiness']}</div>"
+            f"<div class='mini' style='color:{col}'>{words}</div></div><div class='rc-r'>"
+            f"<div class='rc-date'>{esc(ck['nice_date'])}</div>"
+            f"<div class='mini'>Week {ck['iso_week']} of the year  ·  plan week of {date.fromisoformat(ck['plan_week']):%d %b}</div>"
+            f"<div style='margin:10px 0 4px;font-weight:700'>Completed {ck['done']} of {ck['total']} exercises ({bar}%)</div>"
+            f"<div class='bar'><span style='width:{bar}%'></span></div>"
+            f"<div class='mini' style='margin-top:6px'>Rest score {ck['readiness']}/100 from {ck['sleep']:g} h sleep and soreness {ck['soreness']:g}/5"
+            f"  ·  effort {ck['rpe']:g}/10  ·  saved {ck['saved_at'][11:16]}</div></div></div>")
+
+
+# ---------------- Community feed (newest first, grouped by day) ----------------
+def community_feed_html(uid, filt="All"):
+    want = FILTERS.get(filt)
+    recs = [r for r in gateway.library_all(("member", uid)) if (r["status"] == want if want else r["status"] != "superseded")]
+    recs.sort(key=lambda r: r.get("shared_at") or r["created_at"], reverse=True)
+    if not recs:
+        return ("<div class='panel' style='color:#5B6B82'>Nothing here yet. When a member checks off a day in "
+                "<b>My calendar</b>, the Progress Checker suggests sharing it, and it appears here once they say yes.</div>")
+    saved = {c["record_id"] for c in list_copies(uid)}
+    out, last_day = "", None
+    for r in recs:
+        when = (r.get("shared_at") or r["created_at"])
+        day = date.fromisoformat(when[:10])
+        if day != last_day:
+            out += f"<div class='fday'>{'Today' if day == date.today() else f'{day:%A %d %B %Y}'}</div>"
+            last_day = day
+        label, bg, fg = STATUS[r["status"]]
+        who = "You" if r["author"] == uid else esc(member_name(r["author"]))
+        exs = " · ".join(esc(nice_ex(e)) for e in r["exercises"][:6])
+        out += (f"<div class='fcard'><div class='fhead'><b>{esc(r['title'])}</b><span class='badge' style='background:{bg};color:{fg}'>{label}</span></div>"
+                f"<div class='mini'>{who}  ·  {when[11:16]}  ·  version {r['version']}"
+                + (f"  ·  done on {date.fromisoformat(r['performed_on']):%a %d %b}: {esc(r.get('result', ''))}" if r.get("performed_on") else "")
+                + (f"  ·  <b style='color:#0D9488'>saved by you</b>" if r["record_id"] in saved else "") +
+                f"</div><div style='margin-top:6px;font-size:14px'>{exs}</div>"
+                + (f"<div class='tips'><b>Tips:</b> {esc(r['notes'])}</div>" if r.get("notes") else "") + "</div>")
+    return f"<div class='feed2'>{out}</div>"
+
+
+def copy_choices(uid):
+    return [(f"{c['title']}  ·  from {member_name(c['author'])}  ·  your version {c['my_version']}", c["record_id"]) for c in list_copies(uid)]
+
+
+def copy_html(uid, rid):
+    c = next((c for c in list_copies(uid) if c["record_id"] == rid), None)
+    if not c:
+        return "<div class='panel' style='color:#5B6B82'>Workouts you save from the community appear here. Only you can see your copies.</div>"
+    hist = "".join(f"<li>{esc(h)}</li>" for h in c["history"])
+    return (f"<div class='panel'><h3 style='margin:0 0 6px'>{esc(c['title'])} <span style='color:#5B6B82;font-weight:400;font-size:14px'>"
+            f"your version {c['my_version']}</span></h3><div style='font-size:14px;line-height:1.6'>{'<br>'.join(esc(nice_ex(e)) for e in c['exercises'])}</div>"
+            + (f"<div class='tips'><b>Your notes:</b> {esc(c['my_notes'])}</div>" if c.get("my_notes") else "")
+            + f"<b style='font-size:13px;color:#5B6B82'>HISTORY</b><ul class='hist'>{hist}</ul>"
+            "<div class='rights'>This copy is private to you. Editing it never changes the original.</div></div>")
+
+
+# ---------------- Progress: history, charts, check-ins ----------------
+MAIN_LIFTS = ["barbell bench press", "barbell back squat", "overhead press", "barbell row", "romanian deadlift",
+              "goblet squat", "dumbbell bench press", "lat pulldown"]
+
+
+def progress_frames(uid):
+    log = pd.read_csv(LOG_PATH)
+    df = log[(log["athlete_id"] == uid) & (log["completed"].astype(str) == "True")]
+    empty = pd.DataFrame({"week": [], "e1rm": [], "exercise": []}), pd.DataFrame({"week": [], "volume": []})
+    if df.empty:
+        return empty
+    df = _with_weeks(df)
+    df["week"] = df["week_start"].dt.strftime("%Y-%m-%d")           # sortable labels keep the weeks in order
+    df["e1rm"] = [e1rm(w, r) for w, r in zip(df["weight_kg"], df["reps"])]
+    lifts = [l for l in MAIN_LIFTS if l in set(df["exercise"])][:4] or sorted(df["exercise"].unique())[:4]
+    e = df[df["exercise"].isin(lifts)].groupby(["week_start", "week", "exercise"])["e1rm"].max().reset_index()
+    v = df.assign(volume=df["reps"] * df["weight_kg"]).groupby(["week_start", "week"])["volume"].sum().round(0).reset_index()
+    return e.sort_values("week_start")[["week", "e1rm", "exercise"]], v.sort_values("week_start")[["week", "volume"]]
+
+
+def readiness_frame(uid):
+    m = pd.read_csv(METRICS_PATH)
+    m = m[m["athlete_id"] == uid].sort_values("date")
+    rows = [(pd.Timestamp(d), readiness_on(uid, d)[0]) for d in m["date"].tail(42)]
+    return pd.DataFrame(rows or [], columns=["date", "rest score"])
+
+
+def checkin_table(uid):
+    out = []
+    for p in list_plans(uid):
+        for d in p["days"]:
+            ck = d.get("checkin")
+            if ck:
+                out.append([ck["date"], d["day"], f"Week {ck['iso_week']}", re.sub(r"[*]", "", d["session"]),
+                            f"{ck['done']}/{ck['total']}", f"{ck['pct']}%", ck["readiness"], ck["sleep"], ck["soreness"]])
+    out.sort(reverse=True)
+    return pd.DataFrame(out or [["", "", "", "No check-ins yet", "", "", "", "", ""]],
+                        columns=["Date", "Day", "Week", "Session", "Done", "Completed", "Rest score", "Sleep (h)", "Soreness"])
+
+
+def history_table(uid, n=40):
+    log = pd.read_csv(LOG_PATH)
+    df = log[log["athlete_id"] == uid]
+    if df.empty:
+        return pd.DataFrame([["", "No workouts yet", "", "", "", ""]], columns=["Date", "Exercise", "Sets", "Reps", "kg", "Done"])
+    g = (df.groupby(["date", "exercise"], sort=False)
+           .agg(sets=("set_no", "count"), reps=("reps", "max"), kg=("weight_kg", "max"),
+                done=("completed", lambda x: "Yes" if x.astype(str).eq("True").all() else "No"))
+           .reset_index().sort_values("date", ascending=False).head(n))
+    g.columns = ["Date", "Exercise", "Sets", "Reps", "kg", "Done"]
+    return g
+
+
+def progress_summary_html(uid):
+    log = pd.read_csv(LOG_PATH)
+    df = log[log["athlete_id"] == uid]
+    days = df[df["completed"].astype(str) == "True"]["date"].nunique() if not df.empty else 0
+    cks = [d["checkin"] for p in list_plans(uid) for d in p["days"] if d.get("checkin")]
+    avg = round(sum(c["pct"] for c in cks) / len(cks)) if cks else None
+    with contextlib.redirect_stdout(io.StringIO()):
+        r = get_recovery_status.invoke({"athlete_id": uid})
+    tiles = [("Training days logged", days), ("Days checked in", len(cks)),
+             ("Average completion", f"{avg}%" if avg is not None else "—"),
+             ("Rest score now", r["readiness"] if r.get("has_data") else "—")]
+    return "<div class='tiles'>" + "".join(f"<div class='tile2'><div class='mini'>{a}</div><div class='big2'>{b}</div></div>" for a, b in tiles) + "</div>"
+
+
+def has_history(uid):
+    log = pd.read_csv(LOG_PATH)
+    return bool((log["athlete_id"] == uid).any())
+
+
+PAGE_CSS += """
+.week {display:grid; grid-template-columns:repeat(7, minmax(0,1fr)); gap:8px}
+.wday {background:#fff; border:1px solid #E2E8F0; border-radius:12px; padding:10px; min-height:110px}
+.wd {font-weight:800} .wdate {color:#5B6B82; font-size:13px} .wsess {font-size:13px; margin-top:6px; font-weight:600}
+.wchip {font-size:12.5px; font-weight:700; margin-top:6px} .mini {font-size:12.5px; color:#5B6B82}
+.result-card {display:flex; gap:18px; align-items:center; background:#fff; border:2px solid #16A34A; border-radius:16px; padding:16px 18px}
+.rc-l {display:flex; flex-direction:column; align-items:center; gap:6px} .rc-date {font-size:20px; font-weight:800}
+.bar {height:10px; background:#E2E8F0; border-radius:999px; overflow:hidden} .bar span {display:block; height:100%; background:#16A34A}
+.feed2 {display:flex; flex-direction:column; gap:10px} .fday {font-weight:800; color:#1E3A8A; margin-top:8px}
+.fcard {background:#fff; border:1px solid #E2E8F0; border-radius:14px; padding:12px 14px}
+.fhead {display:flex; justify-content:space-between; gap:8px; align-items:center}
+.tips {background:#F0FDFA; border:1px solid #99E2D6; border-radius:10px; padding:8px 10px; font-size:13.5px; margin-top:8px; color:#134E4A}
+.tiles {display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:10px}
+.tile2 {background:#fff; border:1px solid #E2E8F0; border-radius:14px; padding:12px 14px} .big2 {font-size:24px; font-weight:800}
+.nav {flex-wrap:wrap !important; gap:6px !important}
+.nav button {white-space:nowrap !important; flex:0 0 auto !important; width:auto !important; padding:0 14px !important}
+.replybox {background:#EFF6FF; border:1px solid #BFD3FB; border-radius:12px; padding:6px 16px !important}
+@media (max-width: 800px) {.week {grid-template-columns:repeat(2, minmax(0,1fr))} .tiles {grid-template-columns:repeat(2, minmax(0,1fr))}}
+"""
+
 print("Pages ready.")
 
 
@@ -2446,10 +2976,13 @@ with gr.Blocks(title="FitPlan") as demo:
     user = gr.State(None)
     top = gr.HTML(topbar())
     with gr.Row(visible=False, elem_classes="nav") as app_nav:
-        nav_dash = gr.Button("Dashboard", variant="primary", scale=0, min_width=130)
-        nav_comm = gr.Button("Community", scale=0, min_width=130)
-        nav_priv = gr.Button("Privacy", scale=0, min_width=110)
-        nav_data = gr.Button("My data", scale=0, min_width=110)
+        nav_dash = gr.Button("Dashboard", variant="primary", scale=0, min_width=100)
+        nav_cal = gr.Button("My calendar", scale=0, min_width=110)
+        nav_prog = gr.Button("Progress", scale=0, min_width=90)
+        nav_comm = gr.Button("Community", scale=0, min_width=100)
+        nav_priv = gr.Button("Privacy", scale=0, min_width=80)
+        nav_data = gr.Button("My data", scale=0, min_width=80)
+        nav_prof = gr.Button("Profile", scale=0, min_width=80)
         gr.HTML("")
         logout = gr.Button("Sign out", scale=0, min_width=110)
 
@@ -2597,9 +3130,14 @@ with gr.Blocks(title="FitPlan") as demo:
             ex1 = gr.Button("Plan my next week", size="sm", scale=0, min_width=170)
             ex2 = gr.Button("Make my sessions 45 minutes", size="sm", scale=0, min_width=230)
             ex3 = gr.Button("How am I progressing?", size="sm", scale=0, min_width=190)
+            ex4 = gr.Button("Give me a meal plan", size="sm", scale=0, min_width=180)
             new_chat = gr.Button("Start a new conversation", size="sm", scale=0, min_width=210)
+        with gr.Row(visible=False, elem_classes="card") as sample_row:
+            gr.HTML("<div><b>No workouts yet.</b> The Progress Checker needs a few weeks of training to review. Check off "
+                    "days in <b>My calendar</b> as you train, or load 4 weeks of made-up sample workouts to try FitPlan now.</div>")
+            sample_btn = gr.Button("Load 4 weeks of sample workouts", variant="primary", scale=0, min_width=280)
         team = gr.HTML(team_html())
-        reply_box = gr.HTML("")
+        reply_box = gr.Markdown("", elem_classes="replybox", visible=False)
         with gr.Row(equal_height=False):
             with gr.Column(scale=1):
                 feed_box = gr.HTML(feed_html([], False))
@@ -2620,11 +3158,59 @@ with gr.Blocks(title="FitPlan") as demo:
             share_no = gr.Button("Keep it private", elem_classes="big", scale=0, min_width=170)
         other_page = gr.HTML("", visible=False)
 
+    # ---------- My calendar: check off each day, see the result, share it ----------
+    cal_rid = gr.State("")
+    with gr.Column(visible=False) as cal_view:
+        gr.HTML("<div class='h2'>My calendar</div><div class='sub'>Your saved plans. Pick a day, tick what you did, and save "
+                "your day. FitPlan works out your rest score, and your Progress Checker can suggest sharing the workout.</div>")
+        cal_plan = gr.Dropdown([], label="Saved plan", interactive=True)
+        cal_week = gr.HTML("")
+        cal_day = gr.Radio([], label="Pick a day", elem_classes="choice")
+        with gr.Column(visible=False) as cal_day_box:
+            cal_day_head = gr.HTML("")
+            cal_items = gr.CheckboxGroup([], label="Tick every exercise you did", elem_classes="choice")
+            with gr.Row():
+                cal_sleep = gr.Number(7.5, label="Sleep last night (hours)")
+                cal_sore = gr.Slider(1, 5, value=2, step=1, label="Soreness (1 none, 5 very sore)")
+                cal_rpe = gr.Slider(5, 10, value=8, step=0.5, label="How hard was it? (effort 5-10)")
+            with gr.Row(visible=False) as cal_watch_row:
+                cal_rhr = gr.Number(None, label="Resting heart rate (from your watch, optional)")
+                cal_hrv = gr.Number(None, label="HRV in ms (from your watch, optional)")
+            cal_save = gr.Button("Save my day", variant="primary", elem_classes="big")
+        cal_msg = gr.HTML("")
+        cal_result = gr.HTML("")
+        with gr.Column(visible=False, elem_classes="sharebox") as cal_share_box:
+            cal_share_head = gr.HTML("")
+            cal_sh_title = gr.Textbox(label="Workout name others will see")
+            cal_sh_ex = gr.Textbox(label="Exercises others will see (one per line; no weights are shared)", lines=4)
+            cal_sh_notes = gr.Textbox(label="Your tips for others (optional)", placeholder="e.g. Great when you only have 40 minutes")
+            with gr.Row():
+                cal_sh_yes = gr.Button("Share with the community", variant="primary", elem_classes="big", scale=0, min_width=240)
+                cal_sh_no = gr.Button("Keep it private", elem_classes="big", scale=0, min_width=170)
+        cal_sh_manual = gr.Button("Share this workout with the community", visible=False)
+
+    # ---------- Progress: history, charts and check-ins ----------
+    with gr.Column(visible=False) as prog_view:
+        gr.HTML("<div class='h2'>Progress</div><div class='sub'>Everything you logged, from your workouts and daily check-ins.</div>")
+        prog_tiles = gr.HTML("")
+        with gr.Row(visible=False) as prog_sample_row:
+            gr.HTML("<div class='mini'>No workouts yet. Check off days in My calendar, or load sample workouts to try it.</div>")
+            prog_sample_btn = gr.Button("Load 4 weeks of sample workouts", scale=0, min_width=280)
+        with gr.Row():
+            prog_e1rm = gr.LinePlot(x="week", y="e1rm", color="exercise", title="Estimated one-rep max by week (kg)",
+                                    x_title="week starting", y_title="kg")
+            prog_vol = gr.BarPlot(x="week", y="volume", title="Weekly volume (reps x kg)", x_title="week starting", y_title="kg")
+        prog_ready = gr.LinePlot(x="date", y="rest score", title="Rest score by day (0-100)", y_title="rest score")
+        prog_checkins = gr.Dataframe(label="My daily check-ins (newest first)", interactive=False, wrap=True)
+        prog_history = gr.Dataframe(label="Workout history (newest first)", interactive=False, wrap=True)
+        prog_targets = gr.Dataframe(label="Next week's targets (progression tool)", interactive=False, wrap=True)
+
     # ---------- Community ----------
     with gr.Column(visible=False) as comm_view:
-        gr.HTML("<div class='h2'>Community workouts</div><div class='sub'>Workouts members chose to share. Your AI team can "
-                "use them in anyone's plan, but only after the person who made it says yes.</div>")
+        gr.HTML("<div class='h2'>Community workouts</div><div class='sub'>Workouts members chose to share, newest first. "
+                "Save one to your workouts to use it in your own plans. Only the person who shared it can change the original.</div>")
         c_pending = gr.HTML("")
+        c_pend_notes = gr.Textbox(label="Your tips for others (optional)", visible=False)
         with gr.Row(visible=False) as c_pending_row:
             c_yes = gr.Button("Yes, share it", variant="primary", elem_classes="big", scale=0, min_width=170)
             c_no = gr.Button("Keep it private", elem_classes="big", scale=0, min_width=170)
@@ -2632,14 +3218,26 @@ with gr.Blocks(title="FitPlan") as demo:
         c_filter = gr.Radio(list(FILTERS), value="All", label="Show", elem_classes="choice")
         with gr.Row(equal_height=False):
             with gr.Column(scale=1):
-                c_list = gr.Radio([], label="Workouts", elem_classes="choice")
+                c_feed = gr.HTML("")
             with gr.Column(scale=1):
+                c_list = gr.Dropdown([], label="Open a workout", interactive=True)
                 c_detail = gr.HTML("")
+                c_save_btn = gr.Button("Save to my workouts", variant="primary", visible=False)
                 with gr.Group(visible=False) as c_edit_box:
                     c_edit_ex = gr.Textbox(label="Exercises (one per line, e.g. push-up x 3x12)", lines=4)
                     c_edit_note = gr.Textbox(label="What did you change?", placeholder="e.g. fewer reps on the shoulder press")
                     c_edit_save = gr.Button("Save as a new version", variant="primary")
                 c_edit_btn = gr.Button("Edit my workout (makes a new version)", visible=False)
+        gr.HTML("<div class='h2' style='font-size:22px;margin-top:14px'>My saved workouts</div>"
+                "<div class='sub'>Your private copies of other members' workouts. Edit them any way you like.</div>")
+        with gr.Row(equal_height=False):
+            with gr.Column(scale=1):
+                c_my_list = gr.Dropdown([], label="Pick a saved workout", interactive=True)
+                c_my_detail = gr.HTML("")
+            with gr.Column(scale=1):
+                c_my_ex = gr.Textbox(label="Exercises (one per line)", lines=4)
+                c_my_notes = gr.Textbox(label="Your notes")
+                c_my_save = gr.Button("Save my version", variant="primary")
         c_tech = gr.Checkbox(label="Behind the scenes (show the stored fields)", value=False)
 
     # ---------- Privacy ----------
@@ -2683,15 +3281,17 @@ with gr.Blocks(title="FitPlan") as demo:
         r_tech = gr.Textbox(label="Behind the scenes", lines=6, interactive=False)
 
     VIEW_COLS = {"signin": signin_view, "signup": signup_view, "forgot": forgot_view, "reset": reset_view, "profile": profile_view, "saved": saved_view, "home": home_view,
-                 "community": comm_view, "privacy": priv_view, "data": data_view, "restart": restart_view}
-    NAV = {"home": nav_dash, "community": nav_comm, "privacy": nav_priv, "data": nav_data, "restart": nav_data}
+                 "community": comm_view, "privacy": priv_view, "data": data_view, "restart": restart_view,
+                 "calendar": cal_view, "progress": prog_view}
+    NAV = {"home": nav_dash, "calendar": nav_cal, "progress": nav_prog, "community": nav_comm, "privacy": nav_priv,
+           "data": nav_data, "profile": nav_prof}
 
-    def show(view):
+    def show(view, nav=None):
+        """Switch screens. The menu shows inside the app, and on the Profile screen when opened from the menu."""
         out = {col: gr.update(visible=(v == view)) for v, col in VIEW_COLS.items()}
-        out[app_nav] = gr.update(visible=view in NAV)
+        out[app_nav] = gr.update(visible=nav if nav is not None else (view in NAV and view != "profile") or view == "restart")
         for v, b_ in NAV.items():
-            if v != "restart":
-                out[b_] = gr.update(variant="primary" if (v == view or (v == "data" and view == "restart")) else "secondary")
+            out[b_] = gr.update(variant="primary" if (v == view or (v == "data" and view == "restart")) else "secondary")
         return out
 
     def wizard(step):
@@ -2720,13 +3320,13 @@ with gr.Blocks(title="FitPlan") as demo:
 
     def render(d, uid, show_tech):
         paused_plan = d.get("status") == "pending" and d.get("plan")
-        reply = f"<div class='okbox' style='font-size:15px'>{esc(d['reply'])}</div>" if d.get("reply") else ""
+        reply = gr.update(value=d.get("reply") or "", visible=bool(d.get("reply")))
         return {team: team_html(d["checker"][0], d["coach"][0], d["checker"][1], d["coach"][1], d["handed"]),
                 feed_box: feed_html(d["feed"], show_tech), report_box: report_html(d["report"]),
                 plan_box: plan_html(d["plan"], d["status"], d.get("feedback", "")), reply_box: reply,
                 decide_row: gr.update(visible=bool(paused_plan)), changes_row: gr.update(visible=False),
                 share_box: share_html(d["share"]), share_row: gr.update(visible=bool(d["share"])),
-                home_html: greet_html(uid), dash: d}
+                home_html: greet_html(uid), dash: d, sample_row: gr.update(visible=not has_history(uid))}
 
     def add(d, text, who, kind="done", tech_=""):
         d["feed"] = [f for f in d["feed"] if f["kind"] != "now"]     # a finished step replaces its "working" line
@@ -2747,6 +3347,7 @@ with gr.Blocks(title="FitPlan") as demo:
                     chunk = "error"
             log = buf.getvalue()
             d["trace"] += log
+            server_log(log, f"[{uid} {tid}] ")
             if chunk == "error":
                 add(d, "Something went wrong. Please try again.", "FitPlan", "stop", log.strip()[-200:])
                 yield render(d, uid, show_tech)
@@ -2809,9 +3410,11 @@ with gr.Blocks(title="FitPlan") as demo:
                         add(d, "Suggested one of your steady workouts for the community (you decide later)",
                             "Progress Checker", "done", f"propose_share -> {upd['share_rid']} pending")
                     continue
-                if node in ("safety_response", "acknowledge"):
+                if node in ("safety_response", "acknowledge", "coach_answer"):
                     d["reply"] = upd.get("reply", "")
                     d["checker"], d["coach"] = ("ready", "Not needed this time"), ("ready", "Not needed this time")
+                    if node == "coach_answer":
+                        d["coach"] = ("done", "Answered your question")
                 if node == "starter_setup":
                     d["report"] = upd.get("progress_report") or {}
                 if node == "save_plan":
@@ -2982,7 +3585,12 @@ with gr.Blocks(title="FitPlan") as demo:
                                       p_eq, p_split, p_pref, p_watch, p_consent, p_share,
                                       dash, thread, ask, team, reply_box, feed_box, report_box, plan_box,
                                       decide_row, changes_row, fb, share_box, share_row, other_page,
-                                      app_nav, nav_dash, nav_comm, nav_priv, nav_data,
+                                      app_nav, nav_dash, nav_comm, nav_priv, nav_data, nav_cal, nav_prog, nav_prof, sample_row,
+                                      cal_rid, cal_plan, cal_week, cal_day, cal_day_box, cal_day_head, cal_items, cal_sleep,
+                                      cal_sore, cal_rpe, cal_watch_row, cal_rhr, cal_hrv, cal_msg, cal_result, cal_share_box,
+                                      cal_share_head, cal_sh_title, cal_sh_ex, cal_sh_notes, cal_sh_manual,
+                                      prog_tiles, prog_sample_row, prog_e1rm, prog_vol, prog_ready, prog_checkins, prog_history,
+                                      prog_targets, c_pend_notes, c_feed, c_save_btn, c_my_list, c_my_detail, c_my_ex, c_my_notes,
                                       c_pending, c_pending_row, c_note, c_filter, c_list, c_detail, c_edit_box, c_edit_ex,
                                       c_edit_note, c_edit_btn, pv_spaces, pv_action, pv_result, pv_log, pv_audit,
                                       d_files, d_which, d_table, d_tech_txt, r_status, r_review, r_table, r_tech]
@@ -3036,6 +3644,7 @@ with gr.Blocks(title="FitPlan") as demo:
     ex1.click(lambda uid, t: (yield from on_ask("Plan my next week", uid, t)), [user, tech], ALL)
     ex2.click(lambda uid, t: (yield from on_ask("Make my sessions 45 minutes", uid, t)), [user, tech], ALL)
     ex3.click(lambda uid, t: (yield from on_ask("How am I progressing?", uid, t)), [user, tech], ALL)
+    ex4.click(lambda uid, t: (yield from on_ask("Can you give me a simple meal plan for my goal?", uid, t)), [user, tech], ALL)
     new_chat.click(lambda uid: render(fresh_dash(), uid, False) | {thread: ""}, user, ALL)
     tech.change(lambda d, t: feed_html((d or {}).get("feed", []), t), [dash, tech], feed_box)
     approve_btn.click(lambda uid, tid, d, t: (yield from on_decide(True, "", uid, tid, d, t)), [user, thread, dash, tech], ALL)
@@ -3048,27 +3657,42 @@ with gr.Blocks(title="FitPlan") as demo:
     share_no.click(lambda uid, tid, d, t: (yield from on_share(False, uid, tid, d, t)), [user, thread, dash, tech], ALL)
     nav_dash.click(go_dashboard_resume, [user, thread], ALL)
 
+    def logged(uid, fn, *a, **k):
+        """Run fn with its printed steps captured, then copy them to the server log."""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            out = fn(*a, **k)
+        server_log(buf.getvalue(), f"[{uid}] ")
+        return out
+
     # ----- Community -----
-    def community_page(uid, filt, key, tech_, note=""):
-        with contextlib.redirect_stdout(io.StringIO()):
-            gateway.review_library()              # the member always sees up-to-date statuses
+    def community_page(uid, filt, key, tech_, note="", my_key=None):
+        logged(uid, gateway.review_library)                  # the member always sees up-to-date statuses
         choices = community_choices(uid, filt)
         keys = [k for _, k in choices]
         key = key if key in keys else (keys[0] if keys else None)
         rec = next((r for r in gateway.library_all(("member", uid)) if record_key(r) == key), None)
         mine = bool(rec and rec["author"] == uid and rec["status"] in ("approved", "outdated"))
+        can_save = bool(rec and rec["author"] != uid and rec["status"] == "approved" and not rec.get("superseded_by"))
         pend = pending_for(uid)
+        mine_choices = copy_choices(uid)
+        mkeys = [k for _, k in mine_choices]
+        my_key = my_key if my_key in mkeys else (mkeys[0] if mkeys else None)
+        my = next((c for c in list_copies(uid) if c["record_id"] == my_key), None)
         return {**show("community"), c_pending: share_html(pend) if pend else "", c_pending_row: gr.update(visible=bool(pend)),
-                c_note: note, c_list: gr.update(choices=choices, value=key), c_detail: record_html(uid, key, tech_),
-                c_edit_btn: gr.update(visible=mine), c_edit_box: gr.update(visible=False)}
+                c_pend_notes: gr.update(visible=bool(pend), value=""),
+                c_note: note, c_feed: community_feed_html(uid, filt), c_list: gr.update(choices=choices, value=key),
+                c_detail: record_html(uid, key, tech_), c_save_btn: gr.update(visible=can_save),
+                c_edit_btn: gr.update(visible=mine), c_edit_box: gr.update(visible=False),
+                c_my_list: gr.update(choices=mine_choices, value=my_key), c_my_detail: copy_html(uid, my_key),
+                c_my_ex: "\n".join(my["exercises"]) if my else "", c_my_notes: (my or {}).get("my_notes", "")}
 
-    def community_decide(uid, yes, filt, key, tech_):
+    def community_decide(uid, yes, filt, key, tech_, notes):
         pend = pending_for(uid)
         if not pend:
             return community_page(uid, filt, key, tech_)
-        with contextlib.redirect_stdout(io.StringIO()):
-            res = gateway.library_decide(("member", uid), pend["record_id"], yes)
-        note = box("okbox", f"Shared. &ldquo;{esc(pend['title'])}&rdquo; is now ready for anyone's plan. Only you can change it."
+        res = logged(uid, gateway.library_decide, ("member", uid), pend["record_id"], yes, {"notes": (notes or "").strip()})
+        note = box("okbox", f"Shared. &ldquo;{esc(pend['title'])}&rdquo; is now at the top of the community feed. Only you can change it."
                    if res == "approved" else "Kept private. Nothing was shared.")
         return community_page(uid, filt, record_key(pend) if res == "approved" else key, tech_, note)
 
@@ -3082,21 +3706,133 @@ with gr.Blocks(title="FitPlan") as demo:
         if not rec or not exs:
             return {c_note: box("errbox", "Please list at least one exercise.")}
         try:
-            with contextlib.redirect_stdout(io.StringIO()):
-                v = gateway.library_update(("member", uid), rec["record_id"], {"exercises": exs}, (note or "updated by the author").strip())
+            v = logged(uid, gateway.library_update, ("member", uid), rec["record_id"], {"exercises": exs},
+                       (note or "updated by the author").strip())
         except AccessDenied:
             return {c_note: box("errbox", "Only the person who shared this workout can change it.")}
         return community_page(uid, filt, f"{rec['record_id']}-v{v}", tech_,
                               box("okbox", f"Saved as version {v}. The old version is kept in the history and no longer used by AI plans."))
 
+    def community_save_copy(uid, key, filt, tech_):
+        rec = next((r for r in gateway.library_all(("member", uid)) if record_key(r) == key), None)
+        if not rec:
+            return {c_note: box("errbox", "Pick a workout first.")}
+        msg_ = logged(uid, save_copy, uid, rec["record_id"])
+        return community_page(uid, filt, key, tech_, box("okbox" if msg_.startswith("Saved") else "errbox", esc(msg_)), rec["record_id"])
+
+    def community_update_copy(uid, my_key, ex_text, notes, filt, key, tech_):
+        if not my_key:
+            return {c_note: box("errbox", "Save a workout from the community first.")}
+        msg_ = logged(uid, update_copy, uid, my_key, ex_text, notes)
+        return community_page(uid, filt, key, tech_, box("okbox" if msg_.startswith("Saved") else "errbox", esc(msg_)), my_key)
+
     nav_comm.click(lambda uid, t: community_page(uid, "All", None, t), [user, c_tech], ALL)
     c_filter.change(lambda uid, f, t: community_page(uid, f, None, t), [user, c_filter, c_tech], ALL)
-    c_list.change(lambda uid, f, k, t: community_page(uid, f, k, t), [user, c_filter, c_list, c_tech], ALL)
+    c_list.change(lambda uid, f, k, t, mk: community_page(uid, f, k, t, "", mk), [user, c_filter, c_list, c_tech, c_my_list], ALL)
     c_tech.change(lambda uid, k, t: record_html(uid, k, t), [user, c_list, c_tech], c_detail)
-    c_yes.click(lambda uid, f, k, t: community_decide(uid, True, f, k, t), [user, c_filter, c_list, c_tech], ALL)
-    c_no.click(lambda uid, f, k, t: community_decide(uid, False, f, k, t), [user, c_filter, c_list, c_tech], ALL)
+    c_yes.click(lambda uid, f, k, t, n: community_decide(uid, True, f, k, t, n), [user, c_filter, c_list, c_tech, c_pend_notes], ALL)
+    c_no.click(lambda uid, f, k, t, n: community_decide(uid, False, f, k, t, n), [user, c_filter, c_list, c_tech, c_pend_notes], ALL)
     c_edit_btn.click(community_open_edit, [user, c_list], ALL)
     c_edit_save.click(community_save_edit, [user, c_list, c_edit_ex, c_edit_note, c_filter, c_tech], ALL)
+    c_save_btn.click(community_save_copy, [user, c_list, c_filter, c_tech], ALL)
+    c_my_list.change(lambda uid, f, k, t, mk: community_page(uid, f, k, t, "", mk), [user, c_filter, c_list, c_tech, c_my_list], ALL)
+    c_my_save.click(community_update_copy, [user, c_my_list, c_my_ex, c_my_notes, c_filter, c_list, c_tech], ALL)
+
+    # ----- My calendar -----
+    def calendar_page(uid, pid=None, idx=None, note=""):
+        plans = list_plans(uid)
+        if not plans:
+            return {**show("calendar"), cal_plan: gr.update(choices=[], value=None), cal_week: week_html(None),
+                    cal_day: gr.update(choices=[], value=None), cal_day_box: gr.update(visible=False), cal_result: "",
+                    cal_msg: note, cal_share_box: gr.update(visible=False), cal_sh_manual: gr.update(visible=False)}
+        plan = next((p_ for p_ in plans if p_["plan_id"] == pid), plans[0])
+        days = plan["days"]
+        if idx in (None, ""):
+            idx = next((i for i, d in enumerate(days) if not d["rest"] and not d.get("checkin")), 0)
+        idx = int(idx)
+        d = days[idx]
+        ck = d.get("checkin")
+        prof = get_profile(uid) or {}
+        pend = next((r for r in gateway.library_all(("member", uid))
+                     if r.get("plan_day") == f"{plan['plan_id']}:{idx}" and r["status"] == "pending"), None)
+        shared = next((r for r in gateway.library_all(("member", uid))
+                       if r.get("plan_day") == f"{plan['plan_id']}:{idx}" and r["status"] in ("approved", "outdated")), None)
+        out = {**show("calendar"), cal_plan: gr.update(choices=[(plan_label(p_), p_["plan_id"]) for p_ in plans], value=plan["plan_id"]),
+               cal_week: week_html(plan), cal_day: gr.update(choices=[(day_label(x), str(i)) for i, x in enumerate(days)], value=str(idx)),
+               cal_day_box: gr.update(visible=True), cal_day_head: day_head_html(d),
+               cal_items: gr.update(choices=[it["label"] for it in d["items"]], value=(ck or {}).get("done_labels", []),
+                                    visible=not d["rest"]),
+               cal_sleep: (ck or {}).get("sleep", 7.5), cal_sore: (ck or {}).get("soreness", 2), cal_rpe: (ck or {}).get("rpe", 8),
+               cal_watch_row: gr.update(visible=bool(prof.get("has_watch"))),
+               cal_msg: note or (box("okbox", f"Shared with the community as &ldquo;{esc(shared['title'])}&rdquo;.") if shared else ""),
+               cal_result: day_result_html(ck), cal_rid: pend["record_id"] if pend else ""}
+        if pend:
+            out.update({cal_share_box: gr.update(visible=True), cal_sh_manual: gr.update(visible=False),
+                        cal_share_head: ("<div style='font-weight:800;font-size:18px'>Share this workout with the community?</div>"
+                                         f"<div style='color:#7A4B00;font-size:14px'>Suggested by your {'Progress Checker' if pend['proposed_by'] == 'progress_analyst' else 'own choice'}: "
+                                         f"{esc(pend.get('why') or '')}. Edit anything below before sharing. Your goal, body details and "
+                                         "the weights you lifted stay private.</div>"),
+                        cal_sh_title: pend["title"], cal_sh_ex: "\n".join(pend["exercises"]), cal_sh_notes: pend.get("notes", "")})
+        else:
+            out.update({cal_share_box: gr.update(visible=False),
+                        cal_sh_manual: gr.update(visible=bool(ck and ck["done"] and not shared))})
+        return out
+
+    def calendar_save_day(uid, pid, idx, items, sleep, sore, rpe, rhr, hrv):
+        if not pid or idx in (None, ""):
+            return {cal_msg: box("errbox", "Pick a saved plan and a day first.")}
+        res, rid, err = logged(uid, complete_day, uid, pid, int(idx), items, sleep, sore, rhr, hrv, rpe)
+        if err:
+            return {cal_msg: box("errbox", esc(err))}
+        note = box("okbox", "Day saved. Your sets are in your workout history"
+                   + (", and your Progress Checker suggests sharing this workout." if rid else "."))
+        return calendar_page(uid, pid, idx, note)
+
+    def calendar_share(uid, pid, idx, rid, yes, title, ex_text, notes):
+        if not rid:
+            return calendar_page(uid, pid, idx)
+        exs = [l.strip() for l in (ex_text or "").splitlines() if l.strip()]
+        res = logged(uid, gateway.library_decide, ("member", uid), rid, yes,
+                     {"title": (title or "").strip(), "exercises": exs, "notes": (notes or "").strip()})
+        note = box("okbox", "Shared. It is now at the top of the Community feed." if res == "approved"
+                   else "Kept private. Nothing was shared.")
+        return calendar_page(uid, pid, idx, note)
+
+    def calendar_manual_share(uid, pid, idx):
+        rid = logged(uid, suggest_day_share, uid, pid, int(idx), "member")
+        return calendar_page(uid, pid, idx, "" if rid else box("errbox", "Tick at least one exercise and save your day first."))
+
+    nav_cal.click(lambda uid: calendar_page(uid), user, ALL)
+    cal_plan.change(lambda uid, pid: calendar_page(uid, pid), [user, cal_plan], ALL)
+    cal_day.change(lambda uid, pid, i: calendar_page(uid, pid, i), [user, cal_plan, cal_day], ALL)
+    cal_save.click(calendar_save_day, [user, cal_plan, cal_day, cal_items, cal_sleep, cal_sore, cal_rpe, cal_rhr, cal_hrv], ALL)
+    cal_sh_yes.click(lambda *a: calendar_share(*a[:4], True, *a[4:]),
+                     [user, cal_plan, cal_day, cal_rid, cal_sh_title, cal_sh_ex, cal_sh_notes], ALL)
+    cal_sh_no.click(lambda *a: calendar_share(*a[:4], False, *a[4:]),
+                    [user, cal_plan, cal_day, cal_rid, cal_sh_title, cal_sh_ex, cal_sh_notes], ALL)
+    cal_sh_manual.click(calendar_manual_share, [user, cal_plan, cal_day], ALL)
+
+    # ----- Progress -----
+    def progress_page(uid, note=""):
+        e, v = progress_frames(uid)
+        with contextlib.redirect_stdout(io.StringIO()):
+            t = get_progression_targets.invoke({"athlete_id": uid})
+        targets = pd.DataFrame([[x["exercise"], x["last_kg"], x["next_kg"], x["reason"]] for x in t] or [["", "", "", ""]],
+                               columns=["Exercise", "Last kg", "Next kg", "Why"])
+        return {**show("progress"), prog_tiles: note + progress_summary_html(uid), prog_sample_row: gr.update(visible=not has_history(uid)),
+                prog_e1rm: e, prog_vol: v, prog_ready: readiness_frame(uid), prog_checkins: checkin_table(uid),
+                prog_history: history_table(uid), prog_targets: targets}
+
+    def load_sample(uid, where):
+        msg_ = logged(uid, load_sample_history, uid)
+        if where == "progress":
+            return progress_page(uid, box("okbox", esc(msg_)))
+        return {**go_dashboard(uid), reply_box: gr.update(value=msg_ + " Now ask: *Plan my next week*.", visible=True)}
+
+    nav_prog.click(lambda uid: progress_page(uid), user, ALL)
+    prog_sample_btn.click(lambda uid: load_sample(uid, "progress"), user, ALL)
+    sample_btn.click(lambda uid: load_sample(uid, "home"), user, ALL)
+    nav_prof.click(lambda uid: {**show("profile", True), **wizard(1), **profile_values(uid), p_msg: ""}, user, ALL)
 
     # ----- Privacy -----
     def privacy_page(uid, tech_):
@@ -3167,10 +3903,10 @@ NGROK_TOKEN, NGROK_DOMAIN = secret("NGROK_AUTHTOKEN"), secret("NGROK_DOMAIN")
 
 if __name__ == "__main__" or os.environ.get("FITPLAN_LAUNCH") == "1":
     IN_COLAB = "google.colab" in sys.modules
-    PORT = int(os.environ.get("PORT", "7860")) if ON_SPACE else int(os.environ.get("FITPLAN_PORT", "7860"))
-    use_ngrok = bool(NGROK_TOKEN) and not ON_SPACE
-    demo.launch(share=(not ON_SPACE) and (not use_ngrok) and os.environ.get("FITPLAN_SHARE", "1" if IN_COLAB else "0") == "1",
-                server_name="0.0.0.0" if ON_SPACE else os.environ.get("FITPLAN_HOST", "127.0.0.1"),
+    PORT = int(os.environ.get("PORT", "7860")) if ON_HOSTED else int(os.environ.get("FITPLAN_PORT", "7860"))
+    use_ngrok = bool(NGROK_TOKEN) and not ON_HOSTED
+    demo.launch(share=(not ON_HOSTED) and (not use_ngrok) and os.environ.get("FITPLAN_SHARE", "1" if IN_COLAB else "0") == "1",
+                server_name="0.0.0.0" if ON_HOSTED else os.environ.get("FITPLAN_HOST", "127.0.0.1"),
                 server_port=PORT, prevent_thread_lock=use_ngrok,
                 theme=THEME, css=CSS + DASH_CSS + PAGE_CSS)
     if use_ngrok:
